@@ -46,6 +46,16 @@ contract VatLike {
 }
 
 
+
+
+interface DSSProxyLike {
+    function execute(address _target, bytes memory _data)
+        external
+        payable
+        returns (bytes32 response);
+    
+}
+
 contract CDPWrapper is inheritingForTestPurpose{
      
     address private owner;
@@ -104,24 +114,42 @@ contract CDPWrapper is inheritingForTestPurpose{
      * Automatically takes the `sender` first CDP 
      */
     function tokenizeCDP() public {
-        // Get CDP ID of first Vault
-        uint CDPID = mk_cdpman.getFirstCDP(mk_proxy.proxies(msg.sender));
+        // Get Proxy of sender
+        address proxy = mk_proxy.proxies(msg.sender);
         
-        address urn = mk_cdpman.getURNHandler(CDPID);
+        // Get CDP ID of first Vault
+        uint CDPID = mk_cdpman.first(proxy);
+        
+        address urn = mk_cdpman.urns(CDPID);
          
-         (, uint256 rate,,,) = vat.ilks(ilk);
-         (uint256 collateral, uint256 dept) = vat.urns(ilk, urn);
+        (, uint256 rate,,,) = vat.ilks(ilk);
+        (uint256 collateral, uint256 dept) = vat.urns(ilk, urn);
          
+
          
-         uint256 dai_eth = getExchangeRate();
+        require(dept*rate/10**27 * 2 < collateral, "CDP not enough collateralized; 200% required");
+        
+        DSSProxyLike _proxy = DSSProxyLike(proxy);
+        // Make sure that everything that exceeds the 200% collateralization is directly paid back (20 dollar tolerance)
+        if (dept*rate/10**27 * 2 - 20 ether > collateral) { 
+            uint256 change = collateral - dept*rate/10**27;
+            
+        }
+        
+        uint256 dai_eth = getExchangeRate();
          
-         uint256 amoutToMint = collateral - (dept*rate/10**27/dai_eth); // Differance between collateral in ETH and stablecoin dept in ETH
-         
-         mk_cdpman.give(CDPID, address(this));
-         cdp_token.mint(msg.sender, amoutToMint);
-         
-         depts[CDPID] = amoutToMint;
-         wrappedCDPs.push(CDPID);
+        uint256 amoutToMint = collateral - (dept*rate/10**27/dai_eth); // Differance between collateral in ETH and stablecoin dept in ETH
+        
+        // Create proxy instance and execute the give function through it
+        
+        bytes memory payload = abi.encodeWithSignature("give(uint256,address)", CDPID, address(this));
+        
+        _proxy.execute(address(mk_cdpman), payload);
+        
+        cdp_token.mint(msg.sender, amoutToMint);
+        
+        depts[CDPID] = amoutToMint;
+        wrappedCDPs.push(CDPID);
     }
     
     /**
@@ -132,7 +160,7 @@ contract CDPWrapper is inheritingForTestPurpose{
     function tokenizeCDP(uint256 CDPID) public {
          
          
-         address urn = mk_cdpman.getURNHandler(CDPID);
+         address urn = mk_cdpman.urns(CDPID);
          
          (, uint256 rate,,,) = vat.ilks(ilk);
          (uint256 collateral, uint256 dept) = vat.urns(ilk, urn);
@@ -175,11 +203,11 @@ contract CDPWrapper is inheritingForTestPurpose{
     /**
      * @dev Unlock specific CDP by providing its ID
      */
-    function unlockAnyCDP(uint256 CDPID) public returns(uint256 cdpid){
+    function unlockspecificCDP(uint256 CDPID) public returns(uint256 cdpid){
         // Get Token balance of sender
         uint256 balance = cdp_token.balanceOf(msg.sender);
         
-
+        require(balance >= depts[CDPID], "Not enough tokens to unlock this vault");
 
         cdp_token.burn(msg.sender, depts[CDPID]);
         // Grant access right of CDP to sender
@@ -216,6 +244,74 @@ contract CDPWrapper is inheritingForTestPurpose{
     }
 }
 
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+
+
+
+
+
+
+// CDP Interface
+interface DssCdpManagerLike {
+    function first(address) external returns(uint256); // Owner => First CDPId
+    function urns(uint256) external returns(address); // CDPId => UrnHandler
+    function give(uint cdp, address dst) external;
+}
+
+
+
+// Proxy Registry Interface
+interface ProxyRegistryLike {
+    function proxies(address) external view returns (address);
+
+    // build proxy contract
+    function build(address owner) external;
+}
+
+
+
+contract inheritingForTestPurpose{
+    
+    ProxyRegistryLike private mk_proxy   = ProxyRegistryLike(0x4678f0a6958e4D2Bc4F1BAF7Bc52E8F3564f3fE4);
+    address private mk_action  = 0x82ecD135Dce65Fbc6DbdD0e4237E0AF93FFD5038;
+    DssCdpManagerLike private mk_cdpman  = DssCdpManagerLike(0x5ef30b9986345249bc32d8928B7ee64DE9435E39);
+    address private mk_jug     = 0x19c0976f590D67707E62397C87829d896Dc0f1F1;
+    address private mk_ethjoin = 0x2F0b23f53734252Bda2277357e97e1517d6B042A;
+    address private mk_daijoin = 0x9759A6Ac90977b93B58547b4A71c78317f391A28;
+    bytes32 ilk =
+        0x4554482d41000000000000000000000000000000000000000000000000000000;
+    uint256 public cdpi;
+    function buildProxyOpenCdpLockETH() public payable {
+        if (mk_proxy.proxies(msg.sender) == address(0)) {
+            mk_proxy.build(msg.sender);
+            
+        }
+        
+        
+        bytes memory payload =
+            abi.encodeWithSignature(
+                "openLockETHAndDraw(address,address,address,address,bytes32,uint256)",
+                mk_cdpman,
+                mk_jug,
+                mk_ethjoin,
+                mk_daijoin,
+                ilk,
+                0
+            );
+             
+             
+        (bool success, ) = mk_proxy.proxies(msg.sender).call{value: msg.value}(abi.encodeWithSignature("execute(address,bytes)",
+                                                                                                                    mk_action,
+                                                                                                                    payload
+                                                                                                                    ));
+        require(success, "no success");
+        cdpi = mk_cdpman.first(mk_proxy.proxies(msg.sender));
+     }
+    
+}
 // SPDX-License-Identifier: MIT
 
 pragma solidity ^0.8.0;
@@ -546,72 +642,4 @@ contract CDPToken is Context, IERC20, IERC20Metadata {
         return _tokenizer;
     }
 }
-// SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.0;
-
-// Proxy Registry Interface
-interface ProxyRegistryLike {
-    function proxies(address) external view returns (address);
-
-    // build proxy contract
-    function build(address owner) external;
-}
-
-
-
-
-// CDP Interface
-// NEEDS TO BE PLACED INTO THE MAIN FAIL AFTER REMOVING TESTS
-interface DssCdpManagerLike {
-    function getFirstCDP(address addr) external view returns (uint);
-    function getOwner(uint) external view returns (address);
-    function give(uint cdp, address dst) external;
-    function getURNHandler(uint256) external view returns(address); // CDPId => UrnHandler
-}
-
-
-
-
-
-
-
-contract inheritingForTestPurpose{
-    
-    ProxyRegistryLike private mk_proxy   = ProxyRegistryLike(0x4678f0a6958e4D2Bc4F1BAF7Bc52E8F3564f3fE4);
-    address private mk_action  = 0x82ecD135Dce65Fbc6DbdD0e4237E0AF93FFD5038;
-    DssCdpManagerLike private mk_cdpman  = DssCdpManagerLike(0x5ef30b9986345249bc32d8928B7ee64DE9435E39);
-    address private mk_jug     = 0x19c0976f590D67707E62397C87829d896Dc0f1F1;
-    address private mk_ethjoin = 0x2F0b23f53734252Bda2277357e97e1517d6B042A;
-    address private mk_daijoin = 0x9759A6Ac90977b93B58547b4A71c78317f391A28;
-    bytes32 ilk =
-        0x4554482d41000000000000000000000000000000000000000000000000000000;
-    uint256 public cdpi;
-    function buildProxyOpenCdpLockETH() public payable {
-        if (mk_proxy.proxies(msg.sender) == address(0)) {
-            mk_proxy.build(msg.sender);
-            
-        }
-        
-        
-        bytes memory payload =
-            abi.encodeWithSignature(
-                "openLockETHAndDraw(address,address,address,address,bytes32,uint256)",
-                mk_cdpman,
-                mk_jug,
-                mk_ethjoin,
-                mk_daijoin,
-                ilk,
-                0
-            );
-             
-             
-        (bool success, ) = mk_proxy.proxies(msg.sender).call{value: msg.value}(abi.encodeWithSignature("execute(address,bytes)",
-                                                                                                                    mk_action,
-                                                                                                                    payload
-                                                                                                                    ));
-        require(success, "no success");
-        cdpi = mk_cdpman.getFirstCDP(mk_proxy.proxies(msg.sender));
-     }
-    
-}
